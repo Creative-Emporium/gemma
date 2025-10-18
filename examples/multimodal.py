@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+# Copyright 2025 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -106,7 +106,7 @@ def get_config():
           "sampling": gm.evals.SamplerEvaluator(
               run=kd.evals.EveryNSteps(1000),
               max_new_tokens=50,  # Sampling parameters
-              num_examples=3,
+              num_batches=3,
               ds=_make_dataset(training=False, sampling=True),
               summaries={
                   "image": kd.summaries.ShowImages(

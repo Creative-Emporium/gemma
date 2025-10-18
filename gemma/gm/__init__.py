@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+# Copyright 2025 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,7 +24,11 @@ with _epy.lazy_api_imports(globals()):
   from gemma.gm import data
   from gemma.gm import evals
   from gemma.gm import losses
+  from gemma.gm import math
   from gemma.gm import nn
   from gemma.gm import text
+  from gemma.gm import tools
   from gemma.gm import sharding
+  from gemma.gm import testing
+  from gemma.gm import typing
   from gemma import peft

@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+# Copyright 2025 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -43,12 +43,22 @@ class CheckpointPath(enum.StrEnum):
 
   # ******** Gemma 3.0 ********
   # Pretrained
+  GEMMA3_270M_PT = 'gs://gemma-data/checkpoints/gemma3-270m-pt'
   GEMMA3_1B_PT = 'gs://gemma-data/checkpoints/gemma3-1b-pt'
   GEMMA3_4B_PT = 'gs://gemma-data/checkpoints/gemma3-4b-pt'
   GEMMA3_12B_PT = 'gs://gemma-data/checkpoints/gemma3-12b-pt'
   GEMMA3_27B_PT = 'gs://gemma-data/checkpoints/gemma3-27b-pt'
   # Instruction Tuned
+  GEMMA3_270M_IT = 'gs://gemma-data/checkpoints/gemma3-270m-it'
   GEMMA3_1B_IT = 'gs://gemma-data/checkpoints/gemma3-1b-it'
   GEMMA3_4B_IT = 'gs://gemma-data/checkpoints/gemma3-4b-it'
   GEMMA3_12B_IT = 'gs://gemma-data/checkpoints/gemma3-12b-it'
   GEMMA3_27B_IT = 'gs://gemma-data/checkpoints/gemma3-27b-it'
+
+  # ******** Gemma 3.0 N ********
+  # Pretrained
+  GEMMA3N_E2B_PT = 'gs://gemma-data/checkpoints/gemma3n-e2b-pt'
+  GEMMA3N_E4B_PT = 'gs://gemma-data/checkpoints/gemma3n-e4b-pt'
+  # Instruction Tuned
+  GEMMA3N_E2B_IT = 'gs://gemma-data/checkpoints/gemma3n-e2b-it'
+  GEMMA3N_E4B_IT = 'gs://gemma-data/checkpoints/gemma3n-e4b-it'

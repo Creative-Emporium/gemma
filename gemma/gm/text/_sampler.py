@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+# Copyright 2025 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 """Sampler for text."""
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 import dataclasses
 import functools
 import random as py_random
@@ -22,15 +22,17 @@ import typing
 from typing import Literal
 
 from etils import enp
-from gemma import params as params_lib
 from gemma.gm.data import _functional
 from gemma.gm.nn import _transformer
-from gemma.gm.text import _sampler_call
+from gemma.gm.text import _prefill
+from gemma.gm.text import _sampler_loop
 from gemma.gm.text import _sampling
 from gemma.gm.text import _tokenizer
-from gemma.gm.vision import _token_utils
+from gemma.gm.typing import _common
+from gemma.gm.utils import _types
 import jax
 import jax.numpy as jnp
+from kauldron import kd
 from kauldron.typing import Array, Float, Int, PRNGKey, PRNGKeyLike, UInt8  # pylint: disable=g-multiple-import,g-importing-member
 import numpy as np
 
@@ -52,7 +54,7 @@ class SamplerOutput:
   """
 
   text: str | list[str]
-  state: _sampler_call.SamplingState
+  state: _sampler_loop.SamplingState
 
   @property
   def tokens(self) -> Int['B L'] | Int['L']:
@@ -100,25 +102,31 @@ class Sampler:
     sampling: Sampling method to use. Default to greedy sampling.
     forbidden_tokens: List of tokens that are forbidden to be generated. If
       providing `str`, it should map to a single token id in the vocab.
+    stop_tokens: List of tokens that will stop generation if generated. If
+      providing `str`, it should map to a single token id in the vocab.
     cache_length: Cache length to use. This is the maximum number of tokens the
       conversation can have (prompts, answers, images for all turns). Setting
       this to a fixed value avoids re-compilation between turns.
     max_out_length: Length of the output buffer for a single turn. Static value
       used to avoid trigering a jit recompilation. Shouldn't be changed unless
       you have a task where the model generates really long outputs.
+    pad_length: If provided, pad the prompt to this length. This ensure the
+      prompt is always the same length, to avoid jit re-compilation.
   """
   # pylint: enable=g-docstring-quotes
 
   model: _transformer.Transformer
-  params: params_lib.Params
+  params: _common.Params
   tokenizer: _tokenizer.Tokenizer = None  # pytype: disable=annotation-type-mismatch
   sampling: _sampling.SamplingMethod = dataclasses.field(
       default_factory=_sampling.Greedy
   )
   forbidden_tokens: Sequence[str | int] | None = None
+  stop_tokens: Sequence[str | int] | None = None
   # TODO(epot): Support and test rolling cache.
   cache_length: int = 4096
   max_out_length: int = 2048
+  pad_length: None | int | tuple[int, ...] = (256, 512, 1024)
 
   def __post_init__(self):
     # If not provided, initialize the tokenizer.
@@ -152,12 +160,14 @@ class Sampler:
       self,
       prompt: str,
       *,
-      images: UInt8['N? H W C'] | None = None,
+      images: UInt8['N? H W C'] | None = ...,
       max_new_tokens: int | None = ...,
+      stream: Literal[False] = ...,
       sampling: _sampling.SamplingMethod = ...,
       rng: PRNGKeyLike | None = ...,
       return_state: Literal[False] = ...,
-      last_state: _sampler_call.SamplingState | None = ...,
+      last_state: _sampler_loop.SamplingState | None = ...,
+      sharding: kd.sharding.ShardingTree | None = ...,
   ) -> str:
     ...
 
@@ -167,30 +177,53 @@ class Sampler:
       self,
       prompt: Sequence[str],
       *,
-      images: Sequence[UInt8['N H W C']] | None = None,
+      images: Sequence[UInt8['N H W C']] | None = ...,
       max_new_tokens: int | None = ...,
+      stream: Literal[False] = ...,
       sampling: _sampling.SamplingMethod = ...,
       rng: PRNGKeyLike | None = ...,
       return_state: Literal[False] = ...,
-      last_state: _sampler_call.SamplingState | None = ...,
+      last_state: _sampler_loop.SamplingState | None = ...,
+      sharding: kd.sharding.ShardingTree | None = ...,
   ) -> list[str]:
     ...
 
-  # `return_logits=True` returns detailed output (`... -> SamplerOutput`).
+  # `return_state=True` returns detailed output (`... -> SamplerOutput`).
   # Supports both batched (`list[str]`) and unbatched (`str`) inputs.
   @typing.overload
   def sample(
       self,
       prompt: str | Sequence[str],
       *,
-      images: UInt8['B? N? H W C'] | None = None,
+      images: UInt8['B? N? H W C'] | None = ...,
       max_new_tokens: int | None = ...,
+      stream: Literal[False] = ...,
       sampling: _sampling.SamplingMethod = ...,
       rng: PRNGKeyLike | None = ...,
       return_state: Literal[True] = ...,
-      last_state: _sampler_call.SamplingState | None = ...,
+      last_state: _sampler_loop.SamplingState | None = ...,
+      sharding: kd.sharding.ShardingTree | None = ...,
   ) -> SamplerOutput:
     ...
+
+  # TODO(epot): Re-activate this. Currently pytype is confused when adding
+  # this, so disabling it. It's ok, as it's mostly for Colab use.
+  # # Streaming version (`stream=True`), yields tokens as they get predicted.
+  # @typing.overload
+  # def sample(
+  #     self,
+  #     prompt: str | Sequence[str],
+  #     *,
+  #     images: UInt8['B? N? H W C'] | None = ...,
+  #     max_new_tokens: int = ...,
+  #     stream: Literal[True] = ...,
+  #     sampling: _sampling.SamplingMethod = ...,
+  #     rng: PRNGKeyLike | None = ...,
+  #     return_state: bool = ...,
+  #     last_state: _sampler_loop.SamplingState | None = ...,
+  #     sharding: kd.sharding.ShardingTree | None = ...,
+  # ) -> Iterator[str | SamplerOutput]:
+  #   ...
 
   def sample(
       self,
@@ -198,10 +231,12 @@ class Sampler:
       *,
       images=None,
       max_new_tokens=None,
+      stream=False,
       sampling=None,
       rng=None,
       return_state=False,
       last_state=None,
+      sharding=None,
   ):
     # pylint: disable=g-docstring-quotes
     '''Samples a string from the model.
@@ -230,8 +265,9 @@ class Sampler:
         the prompt.
       max_new_tokens: Maximum number of new tokens to generate. The transformer
         will process `input_length + max_new_tokens`.
-      sampling: Sampling method to use. If given, will override the default
-        sampling method.
+      stream: If `True`, yields tokens as they get predicted.
+      sampling: Sampling method to use. If given, will override the sampling
+        method provided in `__init__` (default: greedy).
       rng: Seed to use for the sampling method. If `None`, a random seed is
         used. Can be a seed `int` or a `jax.random.PRNGKey` object.
       return_state: If `True`, returns `SamplerOutput` object with additional
@@ -239,6 +275,11 @@ class Sampler:
       last_state: When `return_state=True`, the state can be propagated across
         calls to the sampler, for multi-turn conversations. Use
         `gm.text.ChatSampler` for a simpler API which handles the state for you.
+      sharding: If provided, shard the tokens according to the specified
+        sharding. Users are responsible for ensuring the tokenized prompt is
+        compatible with the sharding. For example, if
+        `sharding=kd.sharding.FIRST_DIM`, the number of prompts must be
+        divisible by the number of devices.
 
     Returns:
       The sampled output.
@@ -250,87 +291,165 @@ class Sampler:
     # Normalize the seed.
     rng = _normalize_rng(rng)
 
-    # Normalize inputs to always be batched.
-    tokens, is_single_prompt = self._encode_prompts(
-        prompt,
-        add_bos=last_state is None,  # Only add BOS for the first turn.
-    )
-    images = _normalize_images(images, is_single_prompt=is_single_prompt)
-
-    # Cache size in the pre-fill phase.
-    # Note that it includes the previous turns and MM tokens.
-    init_cache_length = _get_max_total_len(
-        tokens=tokens,
-        images=images,
-        num_tokens_per_image=self.model.vision_encoder.num_mm_tokens_per_image
-        if self.model.vision_encoder
-        else 0,
-    )
-    if last_state is not None:
-      init_cache_length += int(last_state.used_cache_length)
-    if init_cache_length > self.cache_length:
+    has_batch_dim = _get_has_batch_dim(prompt)
+    if stream and has_batch_dim:
       raise ValueError(
-          'Cache buffer filled up. With the new input, it uses:'
-          f' {init_cache_length}/{self.cache_length} tokens.'
+          'Streaming is not supported for batched prompts. Let us know if you'
+          ' need this feature.'
       )
 
-    # Compute the maximum number of new tokens we can generate before filling
-    # up the cache.
-    # +1 as the last token is not predicted, so if we generate a single
-    # token (max_new_tokens==1), we only need to forward on the
-    # `init_cache_length` (i.e. no extra length needed)
-    remaining_cache_length = self.cache_length - init_cache_length + 1
+    # Normalize the text, images. Tokenize, shard,...
+    inputs = self._get_inputs(
+        prompt=prompt,
+        images=images,
+        add_bos=last_state is None,  # Only add BOS for the first turn.
+        has_batch_dim=has_batch_dim,
+        sharding=sharding,
+    )
+
+    # Prefill the cache.
+    init_state = _prefill.prefill(
+        model=self.model,
+        params=self.params,
+        input=inputs,
+        last_state=last_state,
+        cache_length=self.cache_length,
+        pad_length=self.pad_length,
+        rng=rng,
+        sharding=sharding,
+        # Here we use the static `max_out_length`, as it is used to initialize
+        # the output buffer. However in the sampling loop, users can choose
+        # to only decode a subset by setting a smaller `max_new_tokens`.
+        max_out_length=self.max_out_length,
+    )
+
+    # Max out length is static, while max_new_tokens is dynamic.
+    # This allow to change the max out length without recompiling.
+    if max_new_tokens and max_new_tokens > self.max_out_length:
+      raise ValueError(
+          'max_new_tokens should be smaller or equal to max_out_length. Got:'
+          f' {max_new_tokens} / {self.max_out_length}'
+      )
     max_new_tokens = max_new_tokens or self.max_out_length
-    # Make sure we do not fill up the cache.
-    # TODO(epot): Should raise an error if that ends up being the case after
-    # sampling. We cannot know in advance as maybe the model only predict a
-    # single token.
-    max_new_tokens = min(max_new_tokens, remaining_cache_length)
+    max_new_tokens = jnp.asarray(max_new_tokens)
 
-    if last_state is None:
-      cache = self.model.init_cache(
-          batch_size=len(tokens),
-          dtype=self._dtype,
-          cache_length=self.cache_length,
-      )
-    else:
-      # TODO(epot): Should check shape is compatible with `cache_length`.
-      cache = last_state.cache
+    # TODO(epot): Donate the `init_state`, `last_state`
 
-    sampler = _sampler_call.SamplerCall(
+    sampler = _sampler_loop.SamplerLoop(
         # Static attributes. Changing those will trigger a recompilation.
         model=self.model,
         end_tokens=(
             self.tokenizer.special_tokens.EOS,
             self.tokenizer.special_tokens.END_OF_TURN,
+            *self._normalized_stop_tokens,
         ),
         forbidden_tokens=self._normalized_forbidden_tokens,
         sampling=sampling,
         cache_length=self.cache_length,
-        max_out_length=self.max_out_length,
         special_tokens=self.tokenizer.special_tokens,
     )
+
+    # TODO(epot): Use `jnp.cond` to detect when the cache is full (or use
+    # rolling-cache). Also do add a check that the cache wasn't filled up
+    # after the sampling.
     state = sampler.sample(
         # Dynamic attributes. If the shape changes, will trigger a
         # recompilation.
         params=self.params,
-        tokens=tokens,
-        images=images,
-        cache=cache,
-        last_state=last_state,
-        max_new_tokens=jnp.asarray(max_new_tokens),
-        init_cache_length=init_cache_length,
-        rng=rng,
+        init_state=init_state,
+        max_new_tokens=max_new_tokens,
+        stream=stream,
     )
 
+    if stream:
+      return self._stream_decode_state(  # pytype: disable=bad-return-type
+          state,
+          return_state=return_state,
+      )
+    else:
+      return self._decode_state(  # pytype: disable=bad-return-type
+          state,
+          predicted_tokens=state.predicted_tokens,
+          has_batch_dim=has_batch_dim,
+          return_state=return_state,
+      )
+
+  def _get_inputs(
+      self,
+      *,
+      prompt,
+      images,
+      add_bos,
+      has_batch_dim,
+      sharding,
+  ) -> _types.Input:
+    """Normalize the inputs."""
+    # Normalize inputs to always be batched.
+    tokens = self._tokenize_prompts(
+        prompt,
+        add_bos=add_bos,  # Only add BOS for the first turn.
+    )
+    if sharding is not None:
+      tokens = kd.sharding.device_put(tokens, sharding)
+    # TODO(epot): Reshape images to avoid jax.jit recompilation.
+    images = _normalize_images(images, has_batch_dim=has_batch_dim)
+    if images is not None and sharding is not None:
+      images = kd.sharding.device_put(images, sharding)
+
+    return _types.Input(
+        text=tokens,
+        images=images,
+        config=self.model.config.input_config,
+    )
+
+  def _tokenize_prompts(
+      self,
+      prompt: str | Sequence[str],
+      *,
+      add_bos: bool,
+      pad_length: int | None = None,
+  ) -> Float['B L']:
+    """Encode the prompts."""
+    prompt = _normalize_prompt(prompt)
+    tokens = [self.tokenizer.encode(p, add_bos=add_bos) for p in prompt]
+
+    # Notice that if pad_length exceeds the maximum length of the prompts,
+    # an error will be raised by the `.pad` function below.
+    max_prompt_len = pad_length or max(len(t) for t in tokens)
+    # In multi-host, each host read different data, so sync to the max length
+    # across all hosts.
+    max_prompt_len = _max_across_hosts(max_prompt_len)
+
+    # Batch tokens together
+    tokens = _functional.pad(tokens, max_length=max_prompt_len)
+    tokens = jnp.asarray(tokens)
+    return tokens
+
+  def _decode_state(
+      self,
+      state: _sampler_loop.SamplingState,
+      predicted_tokens: Int['B L'],
+      *,
+      has_batch_dim: bool,
+      return_state: bool,
+  ) -> str | list[str] | SamplerOutput:
+    """Decode the output state."""
     # TODO(epot): Check that the text ends with an exit token (i.e. the
     # cache buffer hasn't been filled up).
 
+    # In multi-host, each host only has a slice of the data. We need to
+    # replicate the data, so each host can decode texts from all other hosts.
+    if jax.process_count() > 1:
+      predicted_tokens = kd.sharding.with_sharding_constraint(
+          predicted_tokens,
+          kd.sharding.REPLICATED,
+      )
+
     # Decode the logits.
-    predicted_texts = [self.tokenizer.decode(t) for t in state.predicted_tokens]
+    predicted_texts = [self.tokenizer.decode(t) for t in predicted_tokens]
 
     # # Unbatch the single prompts.
-    if is_single_prompt:
+    if not has_batch_dim:
       (predicted_texts,) = predicted_texts
 
     # Returns either text or detailed output.
@@ -342,77 +461,68 @@ class Sampler:
     else:
       return predicted_texts  # pytype: disable=bad-return-type
 
-  def _encode_prompts(
+  def _stream_decode_state(
       self,
-      prompt: str | Sequence[str],
+      state_iter: Iterator[_sampler_loop.SamplingState],
       *,
-      add_bos: bool,
-  ) -> tuple[Float['B L'], bool]:
-    """Encode the prompts."""
-    prompt, is_single_prompt = _normalize_prompt(prompt)
-    tokens = [self.tokenizer.encode(p, add_bos=add_bos) for p in prompt]
-
-    max_prompt_len = max(len(t) for t in tokens)
-
-    # Batch tokens together
-    tokens = _functional.pad(tokens, max_length=max_prompt_len)
-    tokens = jnp.asarray(tokens)
-    return tokens, is_single_prompt
+      return_state: bool,
+  ):
+    for i, state in enumerate(state_iter):
+      yield self._decode_state(
+          state,
+          predicted_tokens=state.predicted_tokens[..., i],
+          has_batch_dim=False,
+          return_state=return_state,
+      )
 
   @functools.cached_property
   def _normalized_forbidden_tokens(self) -> tuple[int, ...] | None:
-    if self.forbidden_tokens is None:
-      forbidden_tokens = ()
-    else:
-      forbidden_tokens = tuple(
-          _normalize_token(self.tokenizer, t) for t in self.forbidden_tokens
-      )
+    forbidden_tokens = self._normalize_tokens(self.forbidden_tokens)
     forbidden_tokens += self.tokenizer.FORBIDDEN_TOKENS
     return forbidden_tokens
 
   @functools.cached_property
-  def _dtype(self) -> jnp.dtype:
-    return jax.tree.leaves(self.params)[0].dtype
+  def _normalized_stop_tokens(self) -> tuple[int, ...]:
+    return self._normalize_tokens(self.stop_tokens)
+
+  def _normalize_tokens(
+      self, tokens: Sequence[str | int] | None
+  ) -> tuple[int, ...]:
+    if tokens is None:
+      return ()
+    else:
+      return tuple(_normalize_token(self.tokenizer, t) for t in tokens)
 
 
-def _get_max_total_len(
-    *,
-    tokens: Float['B L'],
-    images: UInt8['B N H W C'] | None = None,
-    num_tokens_per_image: int,
-) -> int:
-  """Compute the maximum length of the output."""
-  if images is None:
-    max_num_images = 0
+def _get_has_batch_dim(prompt: str | Sequence[str]) -> bool:
+  """Returns whether the prompt batched or not."""
+  if isinstance(prompt, str):
+    return False
+  elif _is_str_array(prompt):  # Scalar str array.
+    assert isinstance(prompt, np.ndarray)
+    return bool(prompt.ndim)  # pylint: disable=g-explicit-bool-comparison
   else:
-    _, max_num_images, _, _, _ = images.shape
-  inserted_mm_tokens = _token_utils.get_num_mm_tokens(
-      max_num_images=max_num_images,
-      num_tokens_per_image=num_tokens_per_image,
-  )
-  return tokens.shape[-1] + inserted_mm_tokens
+    return True
 
 
-def _normalize_prompt(prompt: str | Sequence[str]) -> tuple[list[str], bool]:
+def _normalize_prompt(prompt: str | Sequence[str]) -> list[str]:
   """Normalize the inputs."""
   if _is_str_array(prompt):  # Supports batched input array
     assert isinstance(prompt, np.ndarray)
     prompt = prompt.tolist()
 
   if isinstance(prompt, str):
-    is_single_prompt = True
     prompt = [prompt]
   else:
-    is_single_prompt = False
     prompt = list(prompt)
 
-  return prompt, is_single_prompt
+  return prompt
 
 
 def _normalize_images(
     images: Sequence[UInt8['N? H W C']] | UInt8['N? H W C'] | None = None,
     *,
-    is_single_prompt: bool,
+    has_batch_dim: bool,
 ) -> UInt8['B N H W C'] | None:
   """Add optional `B` and `N` dimensions if needed."""
   if images is None:
@@ -425,7 +535,7 @@ def _normalize_images(
 
   # TODO(epot): Supports sequences of images, rather than array. Need then
   # to resize and batch the images.
-  if is_single_prompt:
+  if not has_batch_dim:
     if len(images.shape) == 3:  # Add the `N` optional dimension   # pytype: disable=attribute-error
       images = images[None, ...]
     images = images[None, ...]  # Add the `B` dimension
@@ -441,8 +551,8 @@ def _normalize_token(tokenizer, token: str | int) -> int:
   token_id = tokenizer.encode(token)
   if len(token_id) != 1:
     raise ValueError(
-        'Invalid forbidden token: {token!r}. Forbidden tokens must map to'
-        ' single token ids in the vocab.'
+        'Invalid token: {token!r}. `stop_token`s and `forbidden_token`s must'
+        ' map to single token ids in the vocab.'
     )
   (token_id,) = token_id
   return token_id
@@ -460,3 +570,17 @@ def _is_str_array(x) -> bool:
   if not isinstance(x, np.ndarray):
     return False
   return np.dtype(x.dtype).type in {np.object_, np.str_}
+
+
+def _max_across_hosts(x: int) -> int:
+  """Returns the maximum value across all hosts."""
+  if jax.process_count() == 1:
+    return x
+  x = jnp.asarray([x] * jax.local_device_count())
+  x = _max_across_hosts_pmap(x)
+  return x[0]
+
+
+@functools.partial(jax.pmap, axis_name='i')
+def _max_across_hosts_pmap(x: jax.Array) -> jax.Array:
+  return jax.lax.pmax(x, 'i')

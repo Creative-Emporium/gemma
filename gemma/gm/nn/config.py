@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+# Copyright 2025 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,8 +14,14 @@
 
 """Symbols needed to build new `TransformerConfig`."""
 
-# pylint: disable=g-importing-member
+# pylint: disable=g-importing-member,unused-import,g-import-not-at-top
 
-from gemma.modules import AttentionType  # pylint: disable=unused-import
-from gemma.transformer import QueryPreAttentionNormalisation  # pylint: disable=unused-import
-from gemma.transformer import TransformerConfig  # pylint: disable=unused-import
+from etils import epy as _epy
+
+with _epy.lazy_api_imports(globals()):
+  from gemma.gm.nn._config import make_attention_layers_types
+  from gemma.gm.nn._config import QueryPreAttentionNormalisation
+  from gemma.gm.nn._config import TransformerConfig
+  from gemma.gm.nn._gemma import GEMMA3_ATTENTION_PATTERN
+  from gemma.gm.nn._modules import AttentionType
+  from gemma.gm.nn._transformer import ModelInfo

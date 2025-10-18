@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+# Copyright 2025 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ from __future__ import annotations
 import dataclasses
 
 import einops
+from etils.etree import jax as etree  # pylint: disable=g-importing-member
 from gemma.gm.data import _functional
 from gemma.gm.text import _template
 from gemma.gm.text import _tokenizer
@@ -105,6 +106,9 @@ class Seq2SeqTask(grain.MapTransform):
   sampling: bool = False
 
   def map(self, element):
+    # Deep-copy to avoid mutating the input.
+    element = etree.copy(element)
+
     # Extract the values from the `dict` example.
     # `kontext.get_by_path(element, self.in_prompt)` is equivalent to
     # `element[self.in_prompt]`, but supports nested dicts and dataclasses.
@@ -204,6 +208,7 @@ class ContrastiveTask(grain.MapTransform):
   in_rejected: kd.kontext.Key  # e.g. `'rejected'`
 
   out_tokens: kd.kontext.Key  # e.g. `'tokens'`
+  out_targets: kd.kontext.Key  # e.g. `'target'`
   out_mask: kd.kontext.Key  # e.g. `'mask'`
 
   tokenizer: _tokenizer.Tokenizer
@@ -261,6 +266,7 @@ class ContrastiveTask(grain.MapTransform):
     # Add the fields to the output `dict`.
     # Equivalent to `element[self.out_input] = ...`
     kd.kontext.set_by_path(element, self.out_tokens, out.input)
+    kd.kontext.set_by_path(element, self.out_targets, out.target)
     kd.kontext.set_by_path(element, self.out_mask, out.target_mask)
 
     # TODO(epot): Supports nested drop

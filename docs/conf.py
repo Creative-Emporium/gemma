@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+# Copyright 2025 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,10 +27,13 @@ import apitree
 
 
 _COLABS_NAMES = [
+    'tool_use',
     'finetuning',
     'lora_sampling',
     'lora_finetuning',
     'multimodal',
+    'quantization_aware_training',
+    'quantization_sampling',
     'sampling',
     'sharding',
     'tokenizer',

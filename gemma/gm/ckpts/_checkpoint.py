@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+# Copyright 2025 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,17 +19,23 @@ from __future__ import annotations
 import dataclasses
 import enum
 import functools
+import operator
+import sys
 import typing
 from typing import Any, TypeVar
 
 from etils import epath
+from etils.etree import jax as etree  # pylint: disable=g-importing-member
 import flax
-from gemma import params as params_lib
+from gemma.gm.ckpts import _compat
 from gemma.gm.ckpts import _quantization
+from gemma.gm.typing._common import Params  # pylint: disable=g-importing-member
 import jax
 from kauldron import kd
 import numpy as np
 from orbax import checkpoint as ocp
+
+_FnT = TypeVar('_FnT')
 
 if typing.TYPE_CHECKING:
   # Likely overkill, but avoid resolving the lazy-import on importing this file.
@@ -73,12 +79,16 @@ class _CheckpointType(enum.StrEnum):
       (e.g. `'{'transformer/layer_0/attn/_key_norm'' ...}`). The structure is
       very messy, but that's unfortunately how the official Gemma checkpoints
       where released.
+    STACKED: Internal checkpoint structure where params with the same attention
+      pattern are stored as stacked dict (e.g.
+      `{'transformer/embedder/layer_0/attn/_key_norm' ...}`).
     KAULDRON: Kauldron `kd.train.Trainer` checkpoint. Those checkpoints contains
       the optimizer state, step,... in addition to the params.
   """
 
   NESTED = enum.auto()
   FLAT = enum.auto()
+  STACKED = enum.auto()
   KAULDRON = enum.auto()
 
 
@@ -86,10 +96,10 @@ class _CheckpointType(enum.StrEnum):
 class _CheckpointTree:
   """Util class to convert checkpoint structures."""
 
-  tree: params_lib.Params
+  tree: Params
 
   @classmethod
-  def shape_dtype_struct_like(cls, tree: params_lib.Params) -> _CheckpointTree:
+  def shape_dtype_struct_like(cls, tree: Params) -> _CheckpointTree:
     """Returns a tree matching the input tree, but with `jax.ShapeDtypeStruct`."""
     tree = jax.tree.map(_as_shape_dtype_struct, tree)
     return _CheckpointTree(tree=tree)
@@ -97,7 +107,9 @@ class _CheckpointTree:
   @functools.cached_property
   def type(self) -> _CheckpointType:
     """Structures of the checkpoint."""
-    if _is_flat_layout(self.tree):
+    if _is_stacked_layout(self.tree):
+      return _CheckpointType.STACKED
+    elif _is_flat_layout(self.tree):
       return _CheckpointType.FLAT
     elif _is_kauldron_layout(self.tree):
       return _CheckpointType.KAULDRON
@@ -105,8 +117,10 @@ class _CheckpointTree:
       return _CheckpointType.NESTED
 
   @functools.cached_property
-  def nested_tree(self) -> params_lib.Params:
+  def nested_tree(self) -> Params:
     """Returns the tree matching the NESTED checkpoint structure."""
+    if self.type == _CheckpointType.STACKED:
+      return _stacked_to_nested(self.tree)
     if self.type == _CheckpointType.FLAT:
       return _flat_to_nested(self.tree)
     elif self.type == _CheckpointType.KAULDRON:
@@ -123,7 +137,9 @@ class _CheckpointTree:
       tree = _remove_mm_params(tree)
     return _CheckpointTree(tree=tree)
 
-  def make_tree_for_params(self, params: _CheckpointTree) -> params_lib.Params:
+  def make_tree_for_params(
+      self, params: _CheckpointTree
+  ) -> Params:
     """Returns the tree matching the checkpoint structure."""
     metadata = _wrap_skip(self)
 
@@ -141,8 +157,12 @@ class _CheckpointTree:
       # Unflatten the params structure
       target_params = _nested_to_flat(ckpt_params)
     elif self.type == _CheckpointType.KAULDRON:
-      target_params = _copy(metadata.tree)
+      target_params = etree.copy(metadata.tree)
       target_params['params'] = ckpt_params
+    elif self.type == _CheckpointType.STACKED:
+      target_params = _nested_to_stacked(
+          ckpt_params, _compat.get_attention_pattern_len(self.tree)
+      )
     else:
       raise ValueError(f'Unsupported checkpoint structure: {self.type}')
 
@@ -152,9 +172,13 @@ class _CheckpointTree:
   def has_mm_params(self) -> bool:
     return 'vision_encoder' in self.nested_tree
 
+  @functools.cached_property
+  def has_audio_input_embedding(self) -> bool:
+    return 'audio_input_embedding' in self.nested_tree.get('embedder', {})
+
 
 def save_params(
-    params: params_lib.Params,
+    params: Params,
     path: epath.PathLike,
 ) -> None:
   """Save the params to a checkpoint.
@@ -170,12 +194,12 @@ def save_params(
 def load_params(
     path: epath.PathLike,
     *,
-    params: params_lib.Params | None = None,
+    params: Params | None = None,
     donate: bool = True,
     text_only: bool = False,
     sharding: kd.sharding.ShardingTree | None = None,
     quantize: bool = False,
-) -> params_lib.Params:
+) -> Params:
   """Restore the params from a checkpoint.
 
   Args:
@@ -241,10 +265,15 @@ def load_params(
   # To supports different checkpoint structures, the original params have to
   # be remapped into the checkpoint structure.
   output_with_skip = metadata.make_tree_for_params(params)
-  # TODO(epot): Support CMSMeta
-
   restore_fn = functools.partial(ckpt.restore, path)
-  output = _partial_restore(restore_fn, output_with_skip, quantize=quantize)
+  output = _partial_restore(restore_fn, output_with_skip)
+
+  # TODO(epot): Better API. Currently this do not quantize the weights, but
+  # just refactor the params to the QAT structure.
+  # Eventually quantize the params. Note: It would be better to do this
+  # while the weights are loaded, so restore do not use unecessary memory.
+  if quantize:
+    output = _quantization.convert_to_qat_checkpoint(output)
 
   # Then after restoring, the params are remapped back to the final structure.
   output = _CheckpointTree(tree=output)
@@ -255,6 +284,13 @@ def load_params(
   # HACK: Manually cast the MM embedder params to f32, otherwise, image
   # produce wrong output on old GPUs (T4, V100)
   tree = output.tree
+  # TODO: b/441529595 - Update this if we need bfloat16 for audio input
+  # embedding.
+  if output.has_audio_input_embedding:
+    tree['embedder']['audio_input_embedding'] = jax.tree.map(
+        lambda x: x.astype(np.float32),
+        output.tree['embedder']['audio_input_embedding'],
+    )
   if output.has_mm_params:
     tree['embedder']['mm_input_projection'] = jax.tree.map(
         lambda x: x.astype(np.float32),
@@ -270,9 +306,16 @@ def load_params(
 # ======================== Structure reformat utils ========================
 
 
-def _flat_to_nested(params: params_lib.Params) -> params_lib.Params:
+def _stacked_to_nested(params: Params) -> Params:
+  """Reformat the params from STACKED to NESTED."""
+  params = etree.copy(params)
+  params = _compat.unstack_params(params)
+  return _flat_to_nested(params)
+
+
+def _flat_to_nested(params: Params) -> Params:
   """Reformat the params from FLAT to NESTED."""
-  params = _copy(params)
+  params = etree.copy(params)
   # Split the params for the MM and the transformer.
   transformer_params = {
       k: v for k, v in params.items() if k.startswith('transformer/')
@@ -291,9 +334,16 @@ def _flat_to_nested(params: params_lib.Params) -> params_lib.Params:
   return transformer_params
 
 
-def _nested_to_flat(params: params_lib.Params) -> params_lib.Params:
+def _nested_to_stacked(params: Params, attn_pattern_len: int) -> Params:
+  """Reformat the params from NESTED to STACKED."""
+  params = _nested_to_flat(params)
+  params = _compat.stack_params(params, attn_pattern_len)
+  return params
+
+
+def _nested_to_flat(params: Params) -> Params:
   """Reformat the params from NESTED to FLAT."""
-  params = _copy(params)  # Copy to allow mutating the tree.
+  params = etree.copy(params)  # Copy to allow mutating the tree.
 
   mm_params = params.pop('vision_encoder', {})
   if mm_params:
@@ -305,19 +355,15 @@ def _nested_to_flat(params: params_lib.Params) -> params_lib.Params:
   return transformer_params | mm_params
 
 
-def _nested_to_flat_single(
-    params: params_lib.Params, *, name: str
-) -> params_lib.Params:
-  params = params_lib.flatten_and_remap_params(params)
+def _nested_to_flat_single(params: Params, *, name: str) -> Params:
+  params = _compat.flatten_and_remap_params(params)
   params = {f'{name}/{k}': v for k, v in params.items()}
   return params
 
 
-def _flat_to_nested_single(
-    params: params_lib.Params, *, name: str
-) -> params_lib.Params:
-  params = params_lib.param_remapper(params)
-  params = params_lib.nest_params(params)
+def _flat_to_nested_single(params: Params, *, name: str) -> Params:
+  params = _compat.param_remapper(params)
+  params = _compat.nest_params(params)
   params = params[name]
   return params
 
@@ -325,7 +371,7 @@ def _flat_to_nested_single(
 def _remove_mm_params(params):
   """Remove the MM params."""
   # Copy to allow mutating the tree.
-  params = _copy(params)
+  params = etree.copy(params)
 
   # TODO(epot): Once orbax supports partial restore, we would not need to
   # load those extra params in the first place.
@@ -336,11 +382,9 @@ def _remove_mm_params(params):
   return params
 
 
-def _add_skip_mm_params(
-    params: params_lib.Params, metadata: _CheckpointTree
-) -> params_lib.Params:
+def _add_skip_mm_params(params: Params, metadata: _CheckpointTree) -> Params:
   """Add skip MM params to restore."""
-  params = _copy(params)
+  params = etree.copy(params)
   params_with_mm = metadata.nested_tree
 
   # Params should not be restored in the first place.
@@ -354,15 +398,27 @@ def _add_skip_mm_params(
   return params
 
 
-def _is_flat_layout(params: params_lib.Params) -> bool:
+def _is_flat_layout(params: Params) -> bool:
   """Returns True is the structure is the legacy one."""
-  return all(
+  return (not _is_stacked_layout(params)) and all(
       k.startswith(('transformer/', 'SigLiPFromPatches_0/'))
       for k in params.keys()
   )
 
 
-def _is_kauldron_layout(params: params_lib.Params) -> bool:
+def _is_stacked_layout(params: Params) -> bool:
+  """Returns True is the structure is the stacked one."""
+  return all(
+      k.startswith((
+          'transformer/embedder',
+          'transformer/final_norm',
+          'transformer/stacked_layers',
+      ))
+      for k in params.keys()
+  )
+
+
+def _is_kauldron_layout(params: Params) -> bool:
   """Returns True is the structure is the Kauldron one."""
   return set(params) == {'collections', 'opt_state', 'params', 'step'}
 
@@ -388,13 +444,10 @@ def _unwrap_skip(tree):
   return jax.tree.map(lambda x: x.val if isinstance(x, _Skip) else x, tree)
 
 
-def _partial_restore(restore_fn, tree_with_skip, quantize: bool = False):
+def _partial_restore(restore_fn, tree_with_skip):
   """Restore the params with partial restore."""
   # TODO(epot): Implement once orbax supports partial restore.
-
   tree = _unwrap_skip(tree_with_skip)
-  if quantize:
-    tree = _quantization.convert_to_qat_checkpoint(tree)
   tree = restore_fn(tree)
   _release_skip(tree, tree_with_skip)
   return tree
@@ -424,27 +477,28 @@ def _release_memory(x):
   return x
 
 
-def _copy(tree):
-  return jax.tree.map(lambda x: x, tree)
-
-
 def _get_metadata_and_path(
     ckpt: ocp.StandardCheckpointer,
     path: epath.PathLike,
 ):
   """Returns the metadata of the checkpoint."""
   path = epath.Path(path)
-  try:
+
+  metadata = ckpt.metadata(path)
+
+  # Kauldron checkpoints structure is different, so the params are contained
+  # in a sub-directory
+  if (
+      metadata.item_metadata is None
+      and path.joinpath('_CHECKPOINT_METADATA').exists()
+  ):
+    path = path / 'default'
     metadata = ckpt.metadata(path)
-  except FileNotFoundError:
-    # Kauldron checkpoints structure is different, so the params are contained
-    # in a sub-directory
-    if path.joinpath('_CHECKPOINT_METADATA').exists():
-      path = path / 'default'
-      metadata = ckpt.metadata(path)
-    else:
-      raise
-  metadata = dict(metadata)  # Normalize metadata
+
+  if metadata.item_metadata is None:  # No item metadata
+    raise ValueError(f'No item metadata found in {path}')
+
+  metadata = metadata.item_metadata.tree  # Normalize metadata
   return metadata, path
 
 

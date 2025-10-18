@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+# Copyright 2025 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ import einops
 from etils import enp
 from etils import epath
 from etils import epy
+from gemma.gm.utils import _file_cache
 import jax
 import jax.numpy as jnp
 from kauldron.utils import immutabledict
@@ -149,19 +150,21 @@ class Tokenizer:
   path: epath.PathLike
   custom_tokens: dict[int, str] = dataclasses.field(default_factory=dict)
 
-  VERSION: ClassVar[int] = 0
+  VERSION: ClassVar[int | str] = 0
   FORBIDDEN_TOKENS: ClassVar[tuple[int, ...]] = ()  # pylint: disable=g-missing-from-attributes
 
   def __post_init__(self):
     immutabledict.freeze_dict_attrs(self, ['custom_tokens'])
 
   @classmethod
-  def from_version(cls, version: int) -> Tokenizer:
+  def from_version(cls, version: int | str) -> Tokenizer:
     """Create a tokenizer from a version."""
     if version == 2:
       return Gemma2Tokenizer()
     elif version == 3:
       return Gemma3Tokenizer()
+    elif version == '3n':
+      return Gemma3nTokenizer()
     else:
       raise ValueError(f'Unsupported tokenizer version: {version}')
 
@@ -249,8 +252,13 @@ class Tokenizer:
   # TODO(epot): Global cache so all instances do not reload the tokenizer.
   @functools.cached_property
   def _sp(self) -> spm.SentencePieceProcessor:
+    """Returns the sentencepiece processor."""
     sp = spm.SentencePieceProcessor()
-    model_proto = epath.Path(self.path).read_bytes()
+    model_file_path = _file_cache.maybe_get_from_cache(
+        remote_file_path=self.path,
+        cache_subdir='tokenizer',
+    )
+    model_proto = epath.Path(model_file_path).read_bytes()
 
     if self.custom_tokens:
       model_proto = self._add_custom_tokens(model_proto)
@@ -310,7 +318,7 @@ class Tokenizer:
     Returns:
       The plot as a plotly figure.
     """
-    if logits.ndim == 2 and logits.shape[1] == 1:  # batch_size==1, flatten
+    if logits.ndim == 2 and logits.shape[0] == 1:  # batch_size==1, flatten
       logits = einops.rearrange(logits, '1 d -> d')
     if logits.ndim != 1:
       raise ValueError(
@@ -338,6 +346,16 @@ class Tokenizer:
         yaxis_title='Probability',
     )
     return fig
+
+  # Pickle protocol
+  # The `spm.SentencePieceProcessor` is not pickleable, so instead implement
+  # pickle protocol.
+
+  def __getstate__(self):
+    return {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+
+  def __setstate__(self, state):
+    self.__init__(**state)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -377,6 +395,29 @@ class Gemma3Tokenizer(Tokenizer):
   )
 
   VERSION = 3
+
+
+@dataclasses.dataclass(frozen=True)
+class Gemma3nTokenizer(Tokenizer):
+  """Tokenizer for Gemma3n."""
+
+  # TODO(epot): Add a util to auto-download and cache the tokenizer from gs://
+  # bucket (e.g. in `~/.gemma/<tokenizer_name>`). Could be customized
+  # through some `GEMMA_CACHE_DIR` environment variable.
+  # TODO(epot): Public GCS path
+  path: epath.PathLike = (
+      'gs://gemma-data/tokenizers/tokenizer_gemma3n.model'
+  )
+
+  special_tokens = _Gemma3SpecialTokens
+
+  # Tokens which are forbidden to be generated in the sampler.
+  FORBIDDEN_TOKENS = (
+      special_tokens.START_OF_IMAGE,
+      special_tokens.END_OF_IMAGE,
+  )
+
+  VERSION = '3n'
 
 
 def _real_whitespaces(text: str) -> str:

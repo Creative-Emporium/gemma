@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+# Copyright 2025 DeepMind Technologies Limited.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,18 +18,22 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import typing
 from typing import Any, ClassVar
 
 import einops
 import flax
 from flax import linen as nn
-from gemma import transformer
-from gemma.gm.utils import _attention_mask
+from gemma.gm.nn import _config
+from gemma.gm.nn import _layers
+from gemma.gm.nn import _modules
 from gemma.gm.utils import _dtype_params
 from gemma.gm.utils import _jax_utils
+from gemma.gm.utils import _types
 from gemma.gm.vision import _token_utils
 from gemma.multimodal import vision as gemma_vision
 import jax.numpy as jnp
+from kauldron import kd
 from kauldron import kontext
 from kauldron.typing import Bool, Float, Int, UInt8, typechecked  # pylint: disable=g-multiple-import,g-importing-member
 
@@ -43,7 +47,7 @@ class ModelInfo:
   Used to auto-load the model tokenizer and params.
   """
 
-  tokenizer_version: int | None = None
+  tokenizer_version: int | str | None = None
   default_ckpt: str | None = None
 
 
@@ -54,11 +58,13 @@ class Output:
   Attributes:
     logits: Predicted logits of the model.
     cache: Updated cache if the input cache is not None, None elsewhere.
+    hidden_states: The hidden states of the model.
   """
 
   # When `return_last_only`, `logits` is `*B V`
   logits: Float['*B L V'] | Float['*B V']
-  cache: transformer.Cache | None
+  cache: _config.Cache | None
+  hidden_states: Float['*B L D'] | Float['*B D'] | None
 
 
 @flax.struct.dataclass
@@ -78,8 +84,7 @@ class _Inputs:
   inputs_mask: Bool['B L']
 
 
-# TODO(epot): Merge this class with `transformer.Transformer`
-class Transformer(transformer.Transformer):
+class Transformer(nn.Module):
   """Base transformer class.
 
   Attributes:
@@ -87,6 +92,7 @@ class Transformer(transformer.Transformer):
       Otherwise, return all logits. Default to `False`
     dtype: The parameter dtype. Default to `jnp.bfloat16`.
   """
+  _: dataclasses.KW_ONLY
 
   return_last_only: bool | None = None
 
@@ -96,22 +102,71 @@ class Transformer(transformer.Transformer):
   # function (e.g. `tokens='batch.tokens'`).
   tokens: kontext.Key = kontext.REQUIRED
   images: kontext.Key | None = None
+  positions: kontext.Key | None = None
+  attention_mask: kontext.Key | None = None
 
+  config: _config.TransformerConfig
   # Model info to specifiy the tokenizer version and default checkpoint.
   INFO: ClassVar[ModelInfo] = ModelInfo()
 
   def __post_init__(self):
-    # TODO(epot): Config should not have `max_cache_length` parameter as
-    # this is a sampling argument independent of the model architecture.
-    # Also rather than inheriting from Transformer, could try unify the API
-    # in a single class.
-    if self.config.max_cache_length is not None:
-      raise ValueError(
-          'The config `max_cache_length` should be None. Got:'
-          f' {self.config.max_cache_length}. Instead, the cache size is set'
-          ' directly in the sampler.'
-      )
     super().__post_init__()
+
+  def setup(self):
+    self.embedder = _modules.Embedder(
+        vocab_size=self.config.num_embed,
+        embed_dim=self.config.embed_dim,
+        vision_proj_dim=self.config.vision_encoder.siglip_encoder.width
+        if self.config.vision_encoder
+        else None,
+    )
+
+    self.blocks = [
+        _modules.Block(
+            name=f'layer_{i}',
+            num_heads=self.config.num_heads,
+            num_kv_heads=self.config.num_kv_heads,
+            embed_dim=self.config.embed_dim,
+            head_dim=self.config.head_dim,
+            hidden_dim=self.config.hidden_dim,
+            sliding_window_size=self.config.sliding_window_size,
+            use_post_attn_norm=self.config.use_post_attn_norm,
+            use_post_ffw_norm=self.config.use_post_ffw_norm,
+            attn_logits_soft_cap=self.config.attn_logits_soft_cap,
+            attn_type=attn_type,
+            query_pre_attn_scalar=self.config.query_pre_attn_scalar(),
+            transpose_gating_einsum=self.config.transpose_gating_einsum,
+            use_qk_norm=self.config.use_qk_norm,
+            rope_base_frequency=self.config.local_base_frequency
+            if attn_type == _modules.AttentionType.LOCAL_SLIDING
+            else self.config.global_base_frequency,
+            rope_scale_factor=self.config.local_scale_factor
+            if attn_type == _modules.AttentionType.LOCAL_SLIDING
+            else self.config.global_scale_factor,
+        )
+        for i, attn_type in zip(
+            range(self.config.num_layers), self.config.attention_types
+        )
+    ]
+    self.final_norm = _layers.RMSNorm()
+
+    self.vision_encoder = self.config.vision_encoder
+
+  if not typing.TYPE_CHECKING:
+
+    def __getattr__(self, name: str):
+      # It's convenient to be able to access the vision encoder directly.
+      # However it has to be initialized in setup, so can't use a standard
+      # `@property`
+      if name == 'vision_encoder':
+        return self.config.vision_encoder
+      return super().__getattr__(name)
+
+  else:  # For type checking / auto-complete
+
+    @property
+    def vision_encoder(self) -> gemma_vision.SigLiPFromPatches | None:
+      return self.config.vision_encoder
 
   # Calling `model.apply` on Colab makes the Kernel crash unless it is jitted.
   @functools.partial(
@@ -119,6 +174,7 @@ class Transformer(transformer.Transformer):
       static_argnames=(
           'self',
           'return_last_only',
+          'return_hidden_states',
       ),
   )
   # The function accepts/returns aribtrary batch shape, but inside the
@@ -131,14 +187,16 @@ class Transformer(transformer.Transformer):
       *,
       images: UInt8['*B N H W C'] | UInt8['*B H W C'] | None = None,
       # TODO(epot): Cleanup and simplify the API.
-      positions: Int['*B L'] | None = None,
-      positions_offset: Int['*B'] | None = None,
-      cache: transformer.Cache | None = None,
+      # When provided, the positions and attention_mask should include
+      # the extra inserted multi-modal tokens.
+      positions: Int['*B L_with_mm'] | None = None,
+      cache: _config.Cache | None = None,
       # During training and pre-filling, the attention mask is `*B L L`
       # When sampling (after prefilling), tokens are decoded one by one,
       # so the attention mask is `*B 1 cache_length`
-      attention_mask: Bool['*B L cache_length'] | None = None,
+      attention_mask: Bool['*B L_with_mm cache_length'] | None = None,
       return_last_only: bool | None = None,
+      return_hidden_states: bool | None = None,
   ) -> Output:  # Output['*B']
     """Transformer forward pass.
 
@@ -149,14 +207,15 @@ class Transformer(transformer.Transformer):
       tokens: input sequence of tokens.
       images: Images to feed to the vision encoder.
       positions: input absolute positions.
-      positions_offset: Offset to add to the positions. Used for multi-turn when
-        the cache is provided and `positions` is None.
       cache: Attention KV cache or None.
       attention_mask: transformer input mask.
       return_last_only: If `True`, only compute and return the logits of the
         last input token in sequence. Useful for decoding where we don't need to
         compute logits for the whole sequence, but only for the last token.
         Otherwise, return all logits. Default to `False`.
+      return_hidden_states: If `True`, return the hidden states of the model.
+        Useful for developing custom models. Otherwise, return only the logits
+        and the cache. Default to `False`.
 
     Returns:
       predicted_logits, new_cache
@@ -166,33 +225,28 @@ class Transformer(transformer.Transformer):
     """
     return_last_only = self._get_return_last_only(return_last_only)
 
-    with _dtype_params.initialize_param_with_dtype(self.dtype):
+    with _dtype_params.initialize_param_with_dtype(
+        self.dtype,
+        exclude=[
+            # The multi-modal params are kept in float32.
+            'vision_encoder',
+            'embedder.mm_input_projection',
+            'embedder.mm_soft_embedding_norm',
+            # Skip the LoRA params
+            'lora',
+        ],
+    ):
 
       # Encode the text tokens, eventually including the vision embeddings.
       inputs = self._encode_and_get_inputs(
           tokens=tokens,
           images=images,
           positions=positions,
-          positions_offset=positions_offset,
           attention_mask=attention_mask,
       )
       del positions, attention_mask
 
-      x = inputs.embeddings
-
-      old_cache = cache or {}
-      new_cache = {}
-      for i, block in enumerate(self.blocks):
-        layer_name = f'layer_{i}'
-        layer_cache, x = block(
-            x,
-            inputs.positions,
-            old_cache.get(layer_name),
-            inputs.attention_mask,
-        )
-        new_cache[layer_name] = layer_cache  # pytype: disable=container-type-mismatch
-
-      x = self.final_norm(x)
+      x, new_cache = self._apply_attention(inputs, cache)
 
     if return_last_only:
       last_input_token_idx = jnp.sum(inputs.inputs_mask, axis=-1) - 1
@@ -217,20 +271,61 @@ class Transformer(transformer.Transformer):
     return Output(
         logits=logits,
         cache=None if cache is None else new_cache,
+        hidden_states=x if return_hidden_states else None,
     )
 
+  def _apply_attention(
+      self, inputs: _Inputs, cache: _config.Cache | None
+  ) -> tuple[Float['*B L D'], _config.Cache]:
+    """Runs the transformer blocks.
+
+    Args:
+      inputs: Input containing embeddings, attention mask, and positions.
+      cache: Attention KV cache or None.
+
+    Returns:
+      Transformer(inputs.embeddings).
+    """
+    x = inputs.embeddings
+    old_cache = cache or {}
+    new_cache = {}
+    for i, block in enumerate(self.blocks):
+      layer_name = f'layer_{i}'
+      layer_cache, x = block(
+          x,
+          inputs.positions,
+          old_cache.get(layer_name),
+          inputs.attention_mask,
+      )
+      new_cache[layer_name] = layer_cache  # pytype: disable=container-type-mismatch
+
+    x = self.final_norm(x)
+    return x, new_cache
+
+  @functools.partial(
+      nn.jit,
+      static_argnames=(
+          'self',
+          'batch_size',
+          'dtype',
+          'cache_length',
+          'sharding',
+      ),
+  )
   def init_cache(
       self,
       *,
       batch_size: int,
       dtype: jnp.dtype[Any],
       cache_length: int,
-  ) -> transformer.Cache:
-    return self.config.init_cache(
+      sharding: kd.sharding.ShardingTree | None = None,
+  ) -> _config.Cache:
+    cache = self.config.init_cache(
         batch_size=batch_size,
         dtype=dtype,
         cache_length=cache_length,
     )
+    return kd.sharding.with_sharding_constraint(cache, sharding)
 
   @typechecked
   def _encode_and_get_inputs(
@@ -238,9 +333,8 @@ class Transformer(transformer.Transformer):
       *,
       tokens: Int['B L_no_mm'],
       images: UInt8['B H W C'] | UInt8['B N H W C'] | None = None,
-      attention_mask: Bool['B L_no_mm cache_length'] | None = None,
-      positions: Int['B L_no_mm'] | None = None,
-      positions_offset: Int['B'] | None = None,
+      attention_mask: Bool['B L_with_mm cache_length'] | None = None,
+      positions: Int['B L_with_mm'] | None = None,
   ) -> _Inputs:
     """Encode the text tokens, eventually including the vision embeddings."""
 
@@ -250,56 +344,45 @@ class Transformer(transformer.Transformer):
       self._assert_support_mm()
       if len(images.shape) == 4:  # Expand optional `num_images` dimension
         images = einops.rearrange(images, 'b h w c -> b 1 h w c')
-      tokens = _token_utils.add_extra_tokens_for_images(
-          tokens,
-          max_num_images=images.shape[1],
-          num_tokens_per_image=self.vision_encoder.num_mm_tokens_per_image,  # pytype: disable=attribute-error
-      )
+
+    inputs = _types.Input(
+        text=tokens,
+        images=images,
+        config=self.config.input_config,
+    )
+    del tokens, images
 
     # Encode the text tokens
     # Could this be optimized to filter out the `SOFT_TOKEN_PLACEHOLDER` ?
     # Currently, The placeholders are required so the mask, positions are
     # correctly computed.
-    x = self.embedder.encode(tokens)
+    x = self.embedder.encode(inputs.tokens_with_mm)
 
     # Encode the vision tokens and merge them with the text embeddings.
-    if images is not None:
-      x = self._merge_mm_embeddings(tokens=tokens, embeddings=x, images=images)
+    if inputs.images is not None:
+      x = self._merge_mm_embeddings(
+          tokens=inputs.tokens_with_mm, embeddings=x, images=inputs.images
+      )
     elif self.vision_encoder is not None and self.is_initializing():
       # During initialization, call the vision encoder to ensure that the
       # params are correctly initialized.
-      dummy_patches = _make_dummy_patches(self.vision_encoder)
-      _ = self.vision_encoder(patches=dummy_patches, is_training=False)
-
-    # Compute the mask (after the extra tokens are added)
-    inputs_mask = tokens != _PADDING_ID
+      _ = self._encode_vision(_make_dummy_images(self.vision_encoder))
 
     # Note: When `positions` and `attention_mask` are explicitly provided,
     # it's the user responsibility to correctly take into account the extra
     # tokens inserted for the images.
     # This is what the `gm.text.Sampler` implementation does.
     if positions is None:
-      positions = transformer.build_positions_from_mask(inputs_mask)
-      # For multi-turn, during the pre-fill phase, the positions should be
-      # shifted to take into account the previous turns.
-      if positions_offset is not None:
-        positions += positions_offset[..., None]
+      positions = inputs.positions
 
     if attention_mask is None:
-      if images is not None:
-        bidirectional_mask = tokens == gemma_vision.TOKEN_PLACEHOLDER
-      else:
-        bidirectional_mask = None
-      attention_mask = _attention_mask.make_causal_bidirectional_attention_mask(
-          inputs_mask,
-          bidirectional_mask=bidirectional_mask,
-      )
+      attention_mask = inputs.attention_mask
 
     return _Inputs(
         embeddings=x,
         positions=positions,
         attention_mask=attention_mask,
-        inputs_mask=inputs_mask,
+        inputs_mask=inputs.inputs_mask,
     )
 
   @typechecked
@@ -325,6 +408,7 @@ class Transformer(transformer.Transformer):
 
   def _encode_vision(self, images: UInt8['B N H W C']) -> Float['B N P D']:
     """Encode the images into the same space as the text embeddings."""
+    assert self.vision_encoder is not None
     patches = self.vision_encoder.patchify_images(images)
     soft_embeddings = self.vision_encoder(patches=patches, is_training=False)
     soft_embeddings = self.embedder.encode_vision(soft_embeddings)
@@ -353,15 +437,11 @@ class Transformer(transformer.Transformer):
       )
 
 
-def _make_dummy_patches(
+def _make_dummy_images(
     vision_encoder: gemma_vision.SigLiPFromPatches,
 ) -> Float['B L P D']:
-  """Make dummy patches for initializing the vision encoder."""
-  patch_height, _ = vision_encoder.siglip_encoder.patch_size
-  num_patches_one_side = vision_encoder.image_height // patch_height
-  num_channels = 3 * patch_height**2
-  num_patches = num_patches_one_side**2
+  """Make dummy images for initializing the vision encoder."""
   return jnp.zeros(
-      shape=(1, 1, num_patches, num_channels),
-      dtype=jnp.float32,
+      (1, 1, vision_encoder.image_height, vision_encoder.image_width, 3),
+      dtype=jnp.uint8,
   )
